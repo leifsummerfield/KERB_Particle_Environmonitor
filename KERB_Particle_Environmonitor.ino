@@ -2,9 +2,32 @@
 //Written by Leif Summerfield - Fall 2016
 //Rev 1   Oct 13  - First psudo code of the whole shebang
 //                  and working well : temp sensors, humidity, logging to terminal and Thingspeak.
+//Rev 2   April 2017  - Rework for Grove breakout board and sensors
+//                    - Meaning we have fixed bits connected now like this
 
+//Async pulse in support
+#include "Particle.h"
 //KERB specific definitions and variables
 #include "KERB_IOT_DEFS.h"
+
+
+#include "AsyncPulseIn.h"
+// Initialize the AsyncPulseIn object to listen on D2 and measure the width of the HIGH part of the pulse
+AsyncPulseIn dustPulse(D2, LOW);
+int dustWidth = 0;
+AsyncPulseIn soundPulse(A1, HIGH);
+
+
+unsigned long duration;
+unsigned long starttime;
+unsigned long sampletime_ms = 500;
+unsigned long lowpulseoccupancy = 0;
+float ratio = 0;
+float concentration = 0;
+
+
+
+
 
 //Adding THingspeak support
 /*
@@ -17,44 +40,92 @@
   unsigned long myChannelNumber = 249857;
   const char * myWriteAPIKey = "VFZPOB94MR02BG5E";
 
+
+  //Adding IBM Watson IOT solution support
+  /*
+    *****************************************************************************************
+    **** Visit https://www.thingspeak.com
+    ****  https://h9vymq.internetofthings.ibmcloud.com/dashboard/
+    *****************************************************************************************/
+    char *IOT_CLIENT = "d:h9vymq:KERB_EnvMnt_particle:BOZ_002";
+    char *IOT_HOST = "h9vymq.messaging.internetofthings.ibmcloud.com";
+    char *IOT_PASSWORD = "823jjajio2300";
+    char *IOT_PUBLISH_1 = "iot-2/evt/Sound/fmt/json";
+    char *IOT_PUBLISH_2 = "iot-2/evt/Temperature/fmt/json";
+    char *IOT_PUBLISH_3 = "iot-2/evt/Dust/fmt/json";
+    char *IOT_PUBLISH_4 = "iot-2/evt/Humidity/fmt/json";
+    char *IOT_PUBLISH_5 = "iot-2/evt/Fumes/fmt/json";
+
+    char *IOT_USERNAME = "use-token-auth";
+    char *IOT_SUBSCRIBE = "iot-2/cmd/lightUp/fmt/json";
+    #include "MQTT.h"
+    MQTT WatsonClient( IOT_HOST, 1883, callback );
+
+
+
 //Adding Running average support section here
 #include "RunningAverage.h"
+RunningAverage gasRA(5);
+RunningAverage particlesRA(5);
+RunningAverage soundRA(2);
+RunningAverage humidityRA(10);
 
-//Setup for noise sensors
-int sum = 0;
-char noiseString[40];
+
+
+
+//Setup for humidity sensors
+#include "SHT31.h"
+//variables on the ..DEFS.h page
+SHT31 sht31 = SHT31();
+
+//Setup for gas quality sensor on A4
+int anGas;
+
 
 void setup() {
-
+    Serial.begin(9600);
+    Serial.println("I'm Allllive !!!!!!");
 // First, declare all of our pins. This lets our device know which ones will be used for outputting voltage, and which ones will read incoming voltage.
     pinMode(anNoise, INPUT);
-    pinMode(TMP36_One, INPUT);
-    pinMode(TMP36_Two, INPUT);
-    pinMode(photoRes2, INPUT);  // Our photoresistor pin is input (reading the photoresistor)
-    pinMode(photoRes1, INPUT);
+    pinMode(gasSensor, INPUT);
+    pinMode(D7, OUTPUT);
 
-    pinMode(switch1, OUTPUT);   digitalWrite(switch1,LOW);
-    pinMode(switch2, OUTPUT);   digitalWrite(switch2,LOW);
-    pinMode(switch3, OUTPUT);   digitalWrite(switch3,LOW);
-    pinMode(switch4, OUTPUT);   digitalWrite(switch4,LOW);
 
+// SHT31 init
+    sht31.begin();
 
     // We are going to declare a Spark.variable() here so that we can access the value of the photoresistor from the cloud.
-    Particle.variable("Noise", &sum, INT);
-
-    // We are also going to declare a Spark.function so that we can turn the LED on and off from the cloud.
-    //Particle.function("led",ledToggle);
-    Particle.function("Switch1",toggler1);
-    Particle.function("Switch2",toggler2);
-    Particle.function("Switch3",toggler3);
-    Particle.function("Switch4",toggler4);
+  //  Particle.variable("Noise", &soundAveraged, INT);
+  //  Particle.variable("Dust", &int(partclsAveraged), INT);
 
 
     //  ThingSpeak setup;
       ThingSpeak.begin(client);
 
+    //  IBM Watson setup
+    // Connect to IBM Watsion IOT Platform
+    WatsonClient.connect( IOT_CLIENT, IOT_USERNAME, IOT_PASSWORD );
+
+    // Subscribe to events if connected. Use LED for status.
+    if( WatsonClient.isConnected() ) {
+    Serial.println("connected");
+    WatsonClient.subscribe( IOT_SUBSCRIBE );
+    }
 
 
+    // Grove Dust sensor on D2 needs async setup and pullup
+    pinMode(D2, INPUT);
+    // Call this to clear any previously saved data
+    dustPulse.clear();
+    soundPulse.clear();
+    // We'll use the millis() function to set our start timer
+    starttime = millis();
+
+    // Running Averages init [first value is of what, 2nd is how many]
+      gasRA.fillValue(600,5);
+      particlesRA.clear();
+      soundRA.clear();
+      humidityRA.clear();
 }
 
 
@@ -62,107 +133,115 @@ void setup() {
   /*****************************************************************************************/
 void loop() {
 
+digitalWrite(D7,HIGH);
 //SECTION 1  - Collect data           ==========================================
 
-for(int i=0; i<100; i++)
-{
-    sum += analogRead(anNoise);
-    sum = sum - 900;    //background subtraction factor
-    delay(10);
-}
+//      sum = analogRead(anNoise);
+//      soundTrigger = soundTrigger + digitalRead(A1);
+
+  //    sound_Width = pulseIn(A1, HIGH);
+    //  sound_Duration = sound_Duration+sound_Width;
 
 
-      sprintf(noiseString,"%d",sum);
-      Particle.publish("Noise",String(sum));
-      //Particle.publish("OneSample", String(analogRead(anNoise)-900));
-      digitalWrite(D7,HIGH);
-      // Write the fields that you've set all at once.
-        ThingSpeak.setField(1,sum);
-        ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+    AsyncPulseInPulseInfo soundPulseInfo;
+    if(soundPulse.getNextPulse(soundPulseInfo)) {
+      //We have a pulse!
+      sound_Width = soundPulseInfo.widthMicros;
+      sound_Duration=sound_Duration+sound_Width;  //total them up
 
-      delay(1000);
+    }
+
+      //Dust sensor pulse widths
+        // Unlike pulseIn(), getNextPulse() is non-blocking. It returns the most recent pulses measured
+        // and stored in a FIFO (first-in, first-out) buffer. If you have a sensor that you need to trigger,
+        // you'd typically call asyncPulse.clear(), trigger the sensor, then you could either wait until
+        // getNextPulse() returns true, or return from loop and handle it later.
+
+        AsyncPulseInPulseInfo pulseInfo;
+      	if(dustPulse.getNextPulse(pulseInfo)) {
+          //We have a pulse!
+          dustWidth = pulseInfo.widthMicros;
+          lowpulseoccupancy = lowpulseoccupancy+dustWidth;
+      	}
+
+    //  dustPulse.clear();
+
+
+//SECTION 2  - Once a second we'll step in here, reduce datea and throw the data to the cloud         ==========================================
+      if ((millis()-starttime) > sampletime_ms)
+      {
       digitalWrite(D7,LOW);
-      delay(100);
-      sum = 0;
+
+      // Do some calculations, run the numbers,
+      ratio = lowpulseoccupancy/(sampletime_ms*1000.0);  // Integer percentage 0=>100
+      concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62; // using spec sheet curve
+      particlesRA.addValue(concentration);
+      partclsAveraged = particlesRA.getAverage();
+
+      //Sound signal averages
+      soundRA.addValue(sound_Duration);   // Integer percentage 0=>100 (PulseIn is in microsecs)
+      soundAveraged = soundRA.getAverage();
+
+      //Grab the non time critical bits to send out
+      //Humidity and Temp sening
+      temp = sht31.getTemperature();
+      temp = temp*9/5 + 32; //convert to F
+      humidityRA.addValue(sht31.getHumidity());
+      humidity = humidityRA.getAverage();
+
+      //Gas quality sensor is just an analog voltage divider, so...
+      // Read the sensor, convert to concentration, and run an average, then we'll post it
+      gasRA.addValue(analogRead(gasSensor));
+      badGasContrn= badGasConversion*gasRA.getAverage() + badGasOffset;
 
 
+        // handle disconnects
+        if( !WatsonClient.isConnected() )
+          {
+          Serial.println("Reconnecting!");
+          WatsonClient.connect( IOT_CLIENT, IOT_USERNAME, IOT_PASSWORD );
+          WatsonClient.subscribe( IOT_SUBSCRIBE );
+          }
+
+        WatsonClient.publish(IOT_PUBLISH_1, "{\"Sound\":"+ String(soundAveraged)+"}");
+        WatsonClient.publish(IOT_PUBLISH_2, "{\"Temperature\":"+ String(temp)+"}");
+        WatsonClient.publish(IOT_PUBLISH_3, "{\"Dust\":"+ String(partclsAveraged)+"}");
+        WatsonClient.publish(IOT_PUBLISH_4, "{\"Humidity\":"+ String(humidity)+"}");
+        WatsonClient.publish(IOT_PUBLISH_5, "{\"Fumes\":"+ String(badGasContrn)+"}");
+
+        /*ThingSpeak.setField(1,soundAveraged);
+        ThingSpeak.setField(2,temp);
+        ThingSpeak.setField(3,humidity);
+        ThingSpeak.setField(4,partclsAveraged);
+        ThingSpeak.setField(5,anGas);
+        ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);*/
+
+        //Print this to Paricle
+        Particle.publish("Noise",String(soundAveraged));
+        Particle.publish("Dust",String(partclsAveraged));
+        Particle.publish("Temp",String(temp));
+        Particle.publish("Humidity",String(humidity));
+        Particle.publish("Fumes",String(badGasContrn));
+
+        //and telemetry out to Serial
+        String telem = "";
+        telem += String(sound_Duration) + ",";             // Plot 2: A1
+        telem += String(soundAveraged);
+        telem += "\r\n"; // Add a new line and we are DONE
+        Serial.print(telem);
+
+//Reset variables before going back out there to real-time land
+        lowpulseoccupancy = 0;  //Reset our bin for adding bit low times
+        starttime = millis();   //reset our
+        sound_Duration = 0;     // reset the noisy counter bin
 
 
+      }// end timer section in main loop that happens once a sec
 
-
-}
+}   // end main loop
 // -----------------------------------------------------end main loop -----------------------------
 //-------------------------------------------------------------------------------------------------
 
-
-double readTmp36(int channel){
-  // check to see what the value of the photoresistor is and store it in the int variable analogvalue
-  analogvalue = analogRead(channel);
-
-// converting that reading to voltage, for 3.3v arduino use 3.3
-
-analogvalue = analogvalue*3.3;
-analogvalue = analogvalue/4095;
-
-// now print out the temperature
- //converting from 10 mv per degree wit 500 mV offset
-analogvalue = (analogvalue) * 100 - 50;
-                                             //to degrees ((voltage - 500mV) times 100)
-// now convert to Fahrenheit
-return analogvalue = (analogvalue * 9.0 / 5.0) + 32.0;
-
-
-}
-
-// check to see what the value of the photoresistor is and store it in the int variable analogvalue
-double readLight(int channel){
-double  light = analogRead(channel)*3.3/4095;
-
-//light = map(light,0,330,0,100);
-
-// now convert to Fahrenheit
-return light;
-}
-
-
-// And now, here's our temp control function
-int isIt_TooHot(int TempIn, int tooHot){
-
-if (TempIn > tooHot){
-  return 1;
-
-}
-  else{
-    return 0;
-  }
-
-
-}
-
-
-
-// Here's our alarm function, pass in the ON & OFF times, and get a 1 or a 0 depending on if we're between them
-//note this is in 24 hour times
-//and note for this algorithm we'll assume ON time is in the PM and OFF time in the AM
-int isIt_Time(int Hour,int OnTime,int OffTime){
-
-//IF Hour is great than OFFTime...
-if (Hour > OffTime){
-  //AND IF Hour is less than OnTime
-  if (Hour < OnTime){
-     //THEN we need to keep alarm OFF
-     Particle.publish("Alarm", "Clock Says OFF" + String(0));
-     return 0;
-  }
-    //ELSE it's time to turn the alarm ON
-  else {
-    Particle.publish("Alarm", "Clock Says ON" + String(1));
-    return 1;
-    }
-
-  }
-
-}
 
 
 //And for a general FET ON/OFF control function
@@ -248,3 +327,58 @@ int ledToggle(String command) {
     }
 
 }
+
+
+// handle commands from the Watson IOT Platform
+// light up one LED, color based on the parameter
+// loop around from 1 to 11, so it shows a history of the values
+int s; // used to decode the incoming character, declare outside the function to keep it off the stack
+int num = 1; // tracks which LED is lit, valid values 1 to 11 (unless heartbeat is on - then change to 1 to 10)
+void callback( char* topic, byte* payload, unsigned int length ) {
+
+ // Wrap around LED indexer. Use 1 and 12 unless heartbeat is on then use 1 to 11
+ if (num > 11)
+ num = 1;
+
+ // convert incoming character to integer
+ s = payload[0]-'0';
+
+ // decode number to color
+ switch (s) {
+ case 1:
+
+ break;
+
+ case 2:
+
+ break;
+ case 3:
+
+ break;
+ default:
+
+ break;
+ }
+ num++;
+}
+
+
+/*Saving for later   Here's the example sketch to convert sensor down time percentage into dust concentration
+It just a linear fit of % down time as X, concentration as Y
+void loop() {
+  duration = pulseIn(pin, LOW);
+  lowpulseoccupancy = lowpulseoccupancy+duration;
+
+  if ((millis()-starttime) > sampletime_ms)
+  {
+    ratio = lowpulseoccupancy/(sampletime_ms*10.0);  // Integer percentage 0=>100
+    concentration = 1.1*pow(ratio,3)-3.8*pow(ratio,2)+520*ratio+0.62; // using spec sheet curve
+    Serial.print(lowpulseoccupancy);
+    Serial.print(",");
+    Serial.print(ratio);
+    Serial.print(",");
+    Serial.println(concentration);
+    lowpulseoccupancy = 0;
+    starttime = millis();
+  }
+}*/
